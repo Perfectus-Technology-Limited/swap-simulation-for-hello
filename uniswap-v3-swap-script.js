@@ -1,4 +1,4 @@
-// Uniswap V3 Automated Swap Script
+// Enhanced Uniswap V3 Automated Swap Script with Smart Retry Logic
 // Requires: npm install ethers@5.7.2 dotenv readline-sync @uniswap/v3-periphery @uniswap/v3-core bignumber.js
 
 require("dotenv").config();
@@ -42,6 +42,39 @@ const WRAPPED_NATIVE_TOKENS = {
   97: "0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd",
 };
 
+// Smart retry configuration
+const RETRY_CONFIG = {
+  maxRetries: 5,
+  baseDelayMs: 2000,
+  maxDelayMs: 30000,
+
+  // Swap amount adjustment strategies
+  amountStrategies: [
+    { factor: 1.0, description: "Original amount" },
+    { factor: 0.5, description: "50% of original amount" },
+    { factor: 0.3, description: "30% of original amount" },
+    { factor: 0.1, description: "10% of original amount" },
+    { factor: 0.05, description: "5% of original amount" },
+  ],
+
+  // Fee tier fallback strategies
+  feeTierStrategies: [
+    3000, // 0.3% - most common
+    500, // 0.05% - stable pairs
+    10000, // 1% - exotic pairs
+    100, // 0.01% - very stable pairs
+  ],
+
+  // Slippage strategies (in basis points, 100 = 1%)
+  slippageStrategies: [
+    100, // 1%
+    200, // 2%
+    500, // 5%
+    1000, // 10%
+    2000, // 20% - last resort
+  ],
+};
+
 // ABIs
 const ERC20_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
@@ -55,6 +88,262 @@ const ERC20_ABI = [
 const UNISWAP_ROUTER_ABI = [
   "function exactInputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)",
 ];
+
+// Error classification system
+class SwapErrorClassifier {
+  static classifyError(error) {
+    const errorMessage = error.message.toLowerCase();
+    const errorReason = error.reason ? error.reason.toLowerCase() : "";
+
+    // Liquidity issues
+    if (
+      errorMessage.includes("insufficient liquidity") ||
+      errorMessage.includes("spr") ||
+      errorReason.includes("spr")
+    ) {
+      return {
+        type: "LIQUIDITY",
+        severity: "HIGH",
+        suggestedActions: [
+          "REDUCE_AMOUNT",
+          "CHANGE_FEE_TIER",
+          "INCREASE_SLIPPAGE",
+        ],
+      };
+    }
+
+    // Pool doesn't exist
+    if (
+      (errorMessage.includes("pool") && errorMessage.includes("not")) ||
+      errorMessage.includes("no pool") ||
+      errorReason.includes("pool")
+    ) {
+      return {
+        type: "NO_POOL",
+        severity: "HIGH",
+        suggestedActions: ["CHANGE_FEE_TIER"],
+      };
+    }
+
+    // Price impact too high
+    if (
+      errorMessage.includes("price") ||
+      errorMessage.includes("slippage") ||
+      errorMessage.includes("too little received")
+    ) {
+      return {
+        type: "PRICE_IMPACT",
+        severity: "MEDIUM",
+        suggestedActions: ["REDUCE_AMOUNT", "INCREASE_SLIPPAGE"],
+      };
+    }
+
+    // Gas issues
+    if (
+      errorMessage.includes("gas") ||
+      errorMessage.includes("out of gas") ||
+      errorMessage.includes("intrinsic gas")
+    ) {
+      return {
+        type: "GAS",
+        severity: "LOW",
+        suggestedActions: ["RETRY"],
+      };
+    }
+
+    // Network issues
+    if (
+      errorMessage.includes("network") ||
+      errorMessage.includes("timeout") ||
+      errorMessage.includes("connection")
+    ) {
+      return {
+        type: "NETWORK",
+        severity: "LOW",
+        suggestedActions: ["RETRY"],
+      };
+    }
+
+    // Insufficient balance
+    if (
+      errorMessage.includes("insufficient") &&
+      (errorMessage.includes("balance") || errorMessage.includes("funds"))
+    ) {
+      return {
+        type: "INSUFFICIENT_BALANCE",
+        severity: "HIGH",
+        suggestedActions: ["REDUCE_AMOUNT"],
+      };
+    }
+
+    // Unknown error
+    return {
+      type: "UNKNOWN",
+      severity: "MEDIUM",
+      suggestedActions: [
+        "REDUCE_AMOUNT",
+        "CHANGE_FEE_TIER",
+        "INCREASE_SLIPPAGE",
+      ],
+    };
+  }
+}
+
+// Smart retry manager
+class SmartRetryManager {
+  constructor(config = RETRY_CONFIG) {
+    this.config = config;
+    this.statistics = {
+      totalAttempts: 0,
+      successfulSwaps: 0,
+      errorsByType: {},
+      strategiesUsed: {},
+    };
+  }
+
+  async executeWithRetry(swapFunction, initialParams) {
+    let lastError = null;
+    let currentParams = { ...initialParams };
+
+    // Try different strategies
+    for (let amountStrategy of this.config.amountStrategies) {
+      for (let feeTier of this.config.feeTierStrategies) {
+        for (let slippage of this.config.slippageStrategies) {
+          // Skip if this is the same as what we already tried
+          if (
+            amountStrategy.factor === 1.0 &&
+            feeTier === initialParams.feeTier &&
+            slippage === this.config.slippageStrategies[0]
+          ) {
+            // Already tried this combination, skip unless it's the first attempt
+            if (this.statistics.totalAttempts > 0) continue;
+          }
+
+          // Adjust parameters
+          currentParams = {
+            ...initialParams,
+            amount: initialParams.amount
+              .mul(Math.floor(amountStrategy.factor * 1000))
+              .div(1000),
+            feeTier: feeTier,
+            slippage: slippage,
+          };
+
+          console.log(
+            `\n🔄 Trying strategy: ${amountStrategy.description}, Fee: ${
+              feeTier / 10000
+            }%, Slippage: ${slippage / 100}%`
+          );
+
+          try {
+            this.statistics.totalAttempts++;
+            const result = await swapFunction(currentParams);
+
+            if (result.success) {
+              this.statistics.successfulSwaps++;
+              this._recordStrategySuccess(amountStrategy, feeTier, slippage);
+              console.log(`✅ Swap successful with adjusted parameters!`);
+              return { success: true, params: currentParams, result };
+            }
+
+            lastError = result.error;
+          } catch (error) {
+            lastError = error;
+            this._recordError(error);
+
+            // Classify error and decide if we should continue
+            const classification = SwapErrorClassifier.classifyError(error);
+            console.log(
+              `❌ Error type: ${classification.type}, Severity: ${classification.severity}`
+            );
+
+            // If it's a fatal error for this strategy combination, skip to next
+            if (
+              classification.severity === "HIGH" &&
+              !this._shouldContinueWithError(classification, currentParams)
+            ) {
+              console.log(
+                `⏩ Skipping to next strategy due to ${classification.type} error`
+              );
+              break;
+            }
+
+            // Add delay between retries
+            await this._delay(
+              this._calculateDelay(this.statistics.totalAttempts)
+            );
+          }
+        }
+      }
+    }
+
+    // All strategies failed
+    console.log(
+      `❌ All retry strategies exhausted. Last error:`,
+      lastError?.message || "Unknown error"
+    );
+    return { success: false, error: lastError, params: currentParams };
+  }
+
+  _shouldContinueWithError(classification, params) {
+    // For certain error types, don't try more aggressive slippage
+    if (classification.type === "NO_POOL" && params.slippage > 500) {
+      return false;
+    }
+
+    if (
+      classification.type === "INSUFFICIENT_BALANCE" &&
+      params.amount.lte(ethers.utils.parseEther("0.001"))
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  _recordError(error) {
+    const classification = SwapErrorClassifier.classifyError(error);
+    this.statistics.errorsByType[classification.type] =
+      (this.statistics.errorsByType[classification.type] || 0) + 1;
+  }
+
+  _recordStrategySuccess(amountStrategy, feeTier, slippage) {
+    const strategyKey = `${amountStrategy.factor}_${feeTier}_${slippage}`;
+    this.statistics.strategiesUsed[strategyKey] =
+      (this.statistics.strategiesUsed[strategyKey] || 0) + 1;
+  }
+
+  _calculateDelay(attemptNumber) {
+    // Exponential backoff with jitter
+    const delay = Math.min(
+      this.config.baseDelayMs * Math.pow(2, attemptNumber - 1),
+      this.config.maxDelayMs
+    );
+
+    // Add random jitter (±25%)
+    const jitter = delay * 0.25 * (Math.random() - 0.5);
+    return Math.max(1000, delay + jitter);
+  }
+
+  async _delay(ms) {
+    console.log(`⏰ Waiting ${Math.floor(ms / 1000)}s before next attempt...`);
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  getStatistics() {
+    return {
+      ...this.statistics,
+      successRate:
+        this.statistics.totalAttempts > 0
+          ? (
+              (this.statistics.successfulSwaps /
+                this.statistics.totalAttempts) *
+              100
+            ).toFixed(2) + "%"
+          : "0%",
+    };
+  }
+}
 
 // Connect to the Ethereum network
 async function connectToEthereum() {
@@ -190,67 +479,92 @@ async function fundWallets(
   }
 }
 
-// Execute a swap on Uniswap V3 or compatible DEX
-async function executeSwap(
-  provider,
-  wallet,
-  tokenA,
-  tokenB,
-  amount,
-  slippage,
-  feeTier
-) {
-  // Get chain ID to determine which router to use
-  const { chainId } = await provider.getNetwork();
+// Calculate minimum amount out with slippage protection
+function calculateMinAmountOut(expectedAmountOut, slippageBasisPoints) {
+  // slippageBasisPoints: 100 = 1%, 500 = 5%, etc.
+  const slippageFactor = ethers.BigNumber.from(10000 - slippageBasisPoints);
+  return expectedAmountOut.mul(slippageFactor).div(10000);
+}
 
-  // Get the appropriate router address for this network
-  const routerAddress = ROUTER_ADDRESSES[chainId];
-  if (!routerAddress) {
-    throw new Error(`No router address configured for chain ID ${chainId}`);
-  }
+// Enhanced swap execution with better error handling
+async function executeSwap(params) {
+  const { provider, wallet, tokenA, tokenB, amount, feeTier, slippage } =
+    params;
 
-  const tokenAContract = new ethers.Contract(tokenA.address, ERC20_ABI, wallet);
-  const uniswapRouter = new ethers.Contract(
-    routerAddress,
-    UNISWAP_ROUTER_ABI,
-    wallet
-  );
-
-  // Check token balance before approving
-  const balance = await tokenAContract.balanceOf(wallet.address);
-  console.log(
-    `Current balance: ${ethers.utils.formatUnits(balance, tokenA.decimals)} ${
-      tokenA.symbol
-    }`
-  );
-
-  if (balance.lt(amount)) {
-    console.error(
-      `Insufficient balance! Have ${ethers.utils.formatUnits(
-        balance,
-        tokenA.decimals
-      )} ${tokenA.symbol}, need ${ethers.utils.formatUnits(
-        amount,
-        tokenA.decimals
-      )} ${tokenA.symbol}`
-    );
-    return false;
-  }
-
-  // Check if pool exists by trying to get the pool address (if using Uniswap V3 or compatible interface)
   try {
-    // This is a simple way to check if the pool exists without deploying a full factory contract
-    console.log(`Checking if pair exists with fee tier ${feeTier}...`);
+    // Get chain ID to determine which router to use
+    const { chainId } = await provider.getNetwork();
 
-    // Use the quoter contract if available to check if pool exists
-    // This is a basic check and will be skipped if it fails
+    // Get the appropriate router address for this network
+    const routerAddress = ROUTER_ADDRESSES[chainId];
+    if (!routerAddress) {
+      throw new Error(`No router address configured for chain ID ${chainId}`);
+    }
+
+    const tokenAContract = new ethers.Contract(
+      tokenA.address,
+      ERC20_ABI,
+      wallet
+    );
+    const uniswapRouter = new ethers.Contract(
+      routerAddress,
+      UNISWAP_ROUTER_ABI,
+      wallet
+    );
+
+    // Check token balance before proceeding
+    const balance = await tokenAContract.balanceOf(wallet.address);
+    console.log(
+      `Current balance: ${ethers.utils.formatUnits(balance, tokenA.decimals)} ${
+        tokenA.symbol
+      }`
+    );
+
+    if (balance.lt(amount)) {
+      throw new Error(
+        `Insufficient balance! Have ${ethers.utils.formatUnits(
+          balance,
+          tokenA.decimals
+        )} ${tokenA.symbol}, need ${ethers.utils.formatUnits(
+          amount,
+          tokenA.decimals
+        )} ${tokenA.symbol}`
+      );
+    }
+
+    // Check and set allowance if needed
+    const currentAllowance = await tokenAContract.allowance(
+      wallet.address,
+      routerAddress
+    );
+    if (currentAllowance.lt(amount)) {
+      console.log(
+        `Setting allowance for ${ethers.utils.formatUnits(
+          amount,
+          tokenA.decimals
+        )} ${tokenA.symbol}...`
+      );
+
+      // Reset allowance to 0 first if it's not 0 (some tokens require this)
+      if (!currentAllowance.isZero()) {
+        const resetTx = await tokenAContract.approve(routerAddress, 0);
+        await resetTx.wait();
+      }
+
+      const approveTx = await tokenAContract.approve(routerAddress, amount);
+      await approveTx.wait();
+      console.log(`✅ Approval successful!`);
+    }
+
+    // Try to get a quote for the swap to estimate output amount
+    let estimatedAmountOut = ethers.BigNumber.from(0);
     try {
       // Different quoter addresses for different chains
       const quoterAddresses = {
-        1: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6", // Ethereum Mainnet Uniswap V3 Quoter
-        137: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6", // Polygon Uniswap V3 Quoter
-        56: "0xbC203d7f83677c7ed3F7acEc959963E7F4ECC5C2", // BSC PancakeSwap V3 Quoter
-        97: "0xbC203d7f83677c7ed3F7acEc959963E7F4ECC5C2", // BSC Testnet PancakeSwap V3 Quoter
+        1: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6", // Ethereum Mainnet
+        137: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6", // Polygon
+        56: "0xbC203d7f83677c7ed3F7acEc959963E7F4ECC5C2", // BSC PancakeSwap V3
+        97: "0xbC203d7f83677c7ed3F7acEc959963E7F4ECC5C2", // BSC Testnet
       };
 
       if (quoterAddresses[chainId]) {
@@ -264,205 +578,123 @@ async function executeSwap(
           provider
         );
 
-        // This will throw if the pool doesn't exist
-        await quoter.callStatic.quoteExactInputSingle(
+        estimatedAmountOut = await quoter.callStatic.quoteExactInputSingle(
           tokenA.address,
           tokenB.address,
           feeTier,
-          ethers.utils.parseUnits("1", tokenA.decimals),
+          amount,
           0
         );
 
         console.log(
-          `Pool exists for ${tokenA.symbol}/${tokenB.symbol} with fee tier ${feeTier}`
+          `💡 Estimated output: ${ethers.utils.formatUnits(
+            estimatedAmountOut,
+            tokenB.decimals
+          )} ${tokenB.symbol}`
         );
       }
     } catch (error) {
-      console.warn(
-        `⚠️ Could not verify if pool exists. This might cause the swap to fail. Error: ${error.message}`
-      );
-
-      // Suggest alternative fee tiers
-      console.log(`⚠️ You might want to try a different fee tier. Common tiers are: 
-        - 100 (0.01%) for stable pairs
-        - 500 (0.05%) for stable-like pairs
-        - 3000 (0.3%) for standard pairs
-        - 10000 (1%) for exotic pairs`);
-
-      const proceed = readline.keyInYN(
-        "Do you want to proceed with the current fee tier anyway?"
-      );
-      if (!proceed) {
-        return false;
-      }
+      console.log(`⚠️ Could not get quote: ${error.message}`);
+      // Continue without quote
     }
-  } catch (error) {
-    console.warn(`Could not check if pool exists: ${error.message}`);
-  }
 
-  // Approve token spending
-  console.log(
-    `Approving ${ethers.utils.formatUnits(amount, tokenA.decimals)} ${
-      tokenA.symbol
-    }...`
-  );
-  try {
-    const approveTx = await tokenAContract.approve(routerAddress, amount);
-    await approveTx.wait();
-    console.log(`Approval successful!`);
+    // Calculate minimum amount out with slippage protection
+    const amountOutMinimum = estimatedAmountOut.gt(0)
+      ? calculateMinAmountOut(estimatedAmountOut, slippage)
+      : 0;
 
-    // Check allowance after approval
-    const allowance = await tokenAContract.allowance(
-      wallet.address,
-      routerAddress
-    );
+    // Execute swap
+    const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes from now
+
+    const swapParams = {
+      tokenIn: tokenA.address,
+      tokenOut: tokenB.address,
+      fee: feeTier,
+      recipient: wallet.address,
+      deadline: deadline,
+      amountIn: amount,
+      amountOutMinimum: amountOutMinimum,
+      sqrtPriceLimitX96: 0, // No price limit
+    };
+
     console.log(
-      `Current allowance: ${ethers.utils.formatUnits(
-        allowance,
+      `🔄 Executing swap: ${ethers.utils.formatUnits(
+        amount,
         tokenA.decimals
-      )} ${tokenA.symbol}`
+      )} ${tokenA.symbol} -> ${tokenB.symbol} (Fee: ${
+        feeTier / 10000
+      }%, Slippage: ${slippage / 100}%)`
     );
 
-    if (allowance.lt(amount)) {
-      console.error(
-        `⚠️ Approval did not work correctly. Allowance (${ethers.utils.formatUnits(
-          allowance,
-          tokenA.decimals
-        )}) is less than needed (${ethers.utils.formatUnits(
-          amount,
-          tokenA.decimals
-        )})`
-      );
-      return false;
-    }
-  } catch (error) {
-    console.error(`Approval failed: ${error.message}`);
-    return false;
-  }
-
-  // Calculate minimum amount out based on slippage
-  const amountOutMinimum = 0; // For simplicity, we're setting this to 0, but in production, calculate this properly
-
-  // Execute swap
-  const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes from now
-
-  const params = {
-    tokenIn: tokenA.address,
-    tokenOut: tokenB.address,
-    fee: feeTier,
-    recipient: wallet.address,
-    deadline: deadline,
-    amountIn: amount,
-    amountOutMinimum: amountOutMinimum,
-    sqrtPriceLimitX96: 0, // No price limit
-  };
-
-  console.log(
-    `Executing swap: ${ethers.utils.formatUnits(amount, tokenA.decimals)} ${
-      tokenA.symbol
-    } -> ${tokenB.symbol}...`
-  );
-  console.log(
-    `Using DEX router at: ${routerAddress} with fee tier: ${feeTier / 10000}%`
-  );
-
-  // For debugging, show the transaction parameters
-  console.log(
-    `Swap parameters: ${JSON.stringify(
-      params,
-      (key, value) => {
-        if (value && value._isBigNumber) return value.toString();
-        return value;
-      },
-      2
-    )}`
-  );
-
-  try {
-    // Estimate gas for the transaction to check if it will fail
+    // Estimate gas first
+    let gasEstimate;
     try {
-      const gasEstimate = await uniswapRouter.estimateGas.exactInputSingle(
-        params,
-        { from: wallet.address }
+      gasEstimate = await uniswapRouter.estimateGas.exactInputSingle(
+        swapParams
       );
-      console.log(`Estimated gas: ${gasEstimate.toString()}`);
+      console.log(`📊 Estimated gas: ${gasEstimate.toString()}`);
     } catch (error) {
-      console.error(
-        `⚠️ Gas estimation failed. The transaction will likely fail: ${error.message}`
-      );
-
-      // Try to get more specific error information
-      if (error.reason || (error.data && error.data.message)) {
-        console.error(`Error reason: ${error.reason || error.data.message}`);
-      }
-
-      const proceed = readline.keyInYN("Do you want to try the swap anyway?");
-      if (!proceed) {
-        return false;
-      }
+      console.log(`⚠️ Gas estimation failed: ${error.message}`);
+      gasEstimate = ethers.utils.hexlify(1200000); // Use higher default gas limit
     }
 
     // Execute the swap transaction
-    const swapTx = await uniswapRouter.exactInputSingle(params, {
-      gasLimit: ethers.utils.hexlify(1000000),
+    const swapTx = await uniswapRouter.exactInputSingle(swapParams, {
+      gasLimit: gasEstimate.mul(120).div(100), // Add 20% buffer
     });
 
-    console.log(`Swap transaction sent: ${swapTx.hash}`);
+    console.log(`📤 Swap transaction sent: ${swapTx.hash}`);
 
     const receipt = await swapTx.wait();
     if (receipt.status === 0) {
-      console.error(`Swap transaction failed!`);
-      return false;
+      throw new Error(`Transaction failed with status 0`);
     }
 
-    console.log(`Swap successful! TX: ${receipt.transactionHash}`);
+    console.log(`✅ Swap successful! TX: ${receipt.transactionHash}`);
 
-    // Check if token B balance increased
+    // Check final balances
+    const newBalanceA = await tokenAContract.balanceOf(wallet.address);
     const tokenBContract = new ethers.Contract(
       tokenB.address,
       ERC20_ABI,
       wallet
     );
-    const newBalance = await tokenBContract.balanceOf(wallet.address);
+    const newBalanceB = await tokenBContract.balanceOf(wallet.address);
+
+    console.log(`📊 Final balances:`);
     console.log(
-      `New ${tokenB.symbol} balance: ${ethers.utils.formatUnits(
-        newBalance,
+      `   ${tokenA.symbol}: ${ethers.utils.formatUnits(
+        newBalanceA,
+        tokenA.decimals
+      )}`
+    );
+    console.log(
+      `   ${tokenB.symbol}: ${ethers.utils.formatUnits(
+        newBalanceB,
         tokenB.decimals
       )}`
     );
 
-    return true;
+    return {
+      success: true,
+      transactionHash: receipt.transactionHash,
+      gasUsed: receipt.gasUsed.toString(),
+      finalBalanceA: newBalanceA,
+      finalBalanceB: newBalanceB,
+    };
   } catch (error) {
-    console.error(`Swap failed: ${error.message}`);
+    console.log(`❌ Swap failed: ${error.message}`);
 
-    // Try to get more specific error information
+    // Enhanced error logging
     if (error.reason) {
-      console.error(`Error reason: ${error.reason}`);
+      console.log(`📋 Error reason: ${error.reason}`);
     }
 
-    // If it's a transaction error, check the receipt for more details
-    if (error.receipt) {
-      console.error(`Transaction receipt status: ${error.receipt.status}`);
-
-      // Look for error events in the logs
-      if (error.receipt.logs && error.receipt.logs.length > 0) {
-        console.log(`Transaction logs: ${JSON.stringify(error.receipt.logs)}`);
-      }
+    if (error.code) {
+      console.log(`📋 Error code: ${error.code}`);
     }
 
-    // Suggest troubleshooting steps
-    console.log(`\nTroubleshooting suggestions:`);
-    console.log(
-      `1. Verify that a liquidity pool exists for this token pair with the specified fee tier (${feeTier})`
-    );
-    console.log(`2. Try a different fee tier (100, 500, 3000, or 10000)`);
-    console.log(`3. Check if there's sufficient liquidity in the pool`);
-    console.log(
-      `4. Verify that the tokens support the Uniswap V3 swap interface`
-    );
-    console.log(`5. Try a smaller amount for the swap`);
-
-    return false;
+    return { success: false, error };
   }
 }
 
@@ -479,7 +711,12 @@ function getRandomNumber(min, max) {
 // Main function
 async function main() {
   try {
-    console.log("====== Uniswap V3 Automated Swap Script ======\n");
+    console.log(
+      "====== Enhanced Uniswap V3 Automated Swap Script with Smart Retry ======\n"
+    );
+
+    // Initialize retry manager
+    const retryManager = new SmartRetryManager();
 
     // Enable debug mode
     const debugMode =
@@ -515,73 +752,6 @@ async function main() {
     console.log(`\nToken A: ${tokenADetails.symbol} (${tokenAAddress})`);
     console.log(`Token B: ${tokenBDetails.symbol} (${tokenBAddress})`);
 
-    // Check if token pair exists
-    if (debugMode) {
-      console.log("\nChecking token pair existence on DEXes...");
-      // This is a basic check and might not work on all networks/DEXes
-      try {
-        // Different factory addresses for different chains
-        const factoryAddresses = {
-          1: "0x1F98431c8aD98523631AE4a59f267346ea31F984", // Ethereum Mainnet Uniswap V3 Factory
-          137: "0x1F98431c8aD98523631AE4a59f267346ea31F984", // Polygon Uniswap V3 Factory
-          56: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865", // BSC PancakeSwap V3 Factory
-          97: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865", // BSC Testnet PancakeSwap V3 Factory
-        };
-
-        if (factoryAddresses[network.chainId]) {
-          const FACTORY_ABI = [
-            "function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)",
-          ];
-
-          const factory = new ethers.Contract(
-            factoryAddresses[network.chainId],
-            FACTORY_ABI,
-            provider
-          );
-
-          // Check across common fee tiers
-          const feeTiers = [100, 500, 3000, 10000];
-          const existingPools = [];
-
-          for (const fee of feeTiers) {
-            try {
-              const poolAddress = await factory.getPool(
-                tokenAAddress,
-                tokenBAddress,
-                fee
-              );
-              if (
-                poolAddress !== "0x0000000000000000000000000000000000000000"
-              ) {
-                existingPools.push({ fee, address: poolAddress });
-                console.log(
-                  `✅ Pool exists for fee tier ${fee} (${
-                    fee / 10000
-                  }%) at ${poolAddress}`
-                );
-              } else {
-                console.log(`❌ No pool for fee tier ${fee} (${fee / 10000}%)`);
-              }
-            } catch (error) {
-              console.log(`Could not check fee tier ${fee}: ${error.message}`);
-            }
-          }
-
-          if (existingPools.length > 0) {
-            console.log(
-              `\nFound ${existingPools.length} existing pools for this token pair.`
-            );
-          } else {
-            console.log(
-              `\n⚠️ No pools found for this token pair. Swaps may fail. You might need to create a pool first or check token addresses.`
-            );
-          }
-        }
-      } catch (error) {
-        console.log(`Could not check for existing pools: ${error.message}`);
-      }
-    }
-
     // Get fee tier
     console.log("\nCommon fee tiers:");
     console.log("- 100 = 0.01% (typically for stable pairs like USDC-USDT)");
@@ -590,21 +760,10 @@ async function main() {
     console.log("- 10000 = 1% (for exotic pairs)");
 
     const feeTier = parseInt(
-      readline.question("Enter fee tier (100, 500, 3000, or 10000): ") || "3000"
+      readline.question(
+        "Enter preferred fee tier (100, 500, 3000, or 10000): "
+      ) || "3000"
     );
-
-    // Validate fee tier
-    if (![100, 500, 3000, 10000].includes(feeTier)) {
-      console.warn(
-        `Warning: Unusual fee tier ${feeTier}. Common values are 100, 500, 3000, or 10000.`
-      );
-      const proceed = readline.keyInYN(
-        "Do you want to proceed with this fee tier?"
-      );
-      if (!proceed) {
-        throw new Error("User aborted due to unusual fee tier");
-      }
-    }
 
     // Get number of swaps to perform
     const totalSwaps = parseInt(
@@ -645,14 +804,20 @@ async function main() {
       )
     );
 
-    // Get retry options
-    const maxRetries = debugMode
-      ? parseInt(
-          readline.question(
-            "Enter maximum number of retries per failed swap (0 for no retries): "
-          ) || "0"
-        )
-      : 0;
+    // Ask about smart retry settings
+    const useSmartRetry = readline.keyInYN(
+      "Enable smart retry with automatic parameter adjustment? (Highly recommended)"
+    );
+
+    if (useSmartRetry) {
+      console.log(
+        "\n🤖 Smart retry is enabled. The script will automatically:"
+      );
+      console.log("   - Adjust swap amounts if liquidity is insufficient");
+      console.log("   - Try different fee tiers if pools don't exist");
+      console.log("   - Increase slippage tolerance for price impact issues");
+      console.log("   - Implement exponential backoff for network issues");
+    }
 
     // Generate wallets
     console.log(`\nGenerating ${walletCount} wallets...`);
@@ -673,8 +838,9 @@ async function main() {
     );
 
     // Perform swaps
-    console.log(`\nStarting ${totalSwaps} swaps...`);
+    console.log(`\nStarting ${totalSwaps} swaps with smart retry enabled...`);
     let completedSwaps = 0;
+    let failedSwaps = 0;
 
     for (let i = 0; i < totalSwaps; i++) {
       // Select a random wallet
@@ -690,9 +856,14 @@ async function main() {
       );
       const swapAmount = ethers.BigNumber.from(randomBN.toString());
 
-      // Execute swap
-      console.log(`\n---- Swap ${i + 1}/${totalSwaps} ----`);
+      console.log(`\n========== Swap ${i + 1}/${totalSwaps} ==========`);
       console.log(`Using wallet: ${wallet.address}`);
+      console.log(
+        `Target amount: ${ethers.utils.formatUnits(
+          swapAmount,
+          tokenADetails.decimals
+        )} ${tokenADetails.symbol}`
+      );
 
       const tokenA = {
         address: tokenAAddress,
@@ -706,54 +877,312 @@ async function main() {
         symbol: tokenBDetails.symbol,
       };
 
-      let success = false;
-      let retries = 0;
+      // Prepare swap parameters
+      const swapParams = {
+        provider,
+        wallet,
+        tokenA,
+        tokenB,
+        amount: swapAmount,
+        feeTier: feeTier,
+        slippage: 100, // Start with 1% slippage
+      };
 
-      // Retry logic
-      while (!success && retries <= maxRetries) {
-        if (retries > 0) {
-          console.log(`Retry ${retries}/${maxRetries}...`);
+      let result;
+
+      if (useSmartRetry) {
+        // Use smart retry manager
+        result = await retryManager.executeWithRetry(executeSwap, swapParams);
+      } else {
+        // Traditional single attempt
+        result = await executeSwap(swapParams);
+      }
+
+      if (result.success) {
+        completedSwaps++;
+        console.log(`✅ Swap ${i + 1} completed successfully!`);
+
+        if (result.result) {
+          console.log(`📊 Gas used: ${result.result.gasUsed}`);
+          console.log(`📦 Transaction: ${result.result.transactionHash}`);
         }
+      } else {
+        failedSwaps++;
+        console.log(`❌ Swap ${i + 1} failed after all retry attempts`);
 
-        success = await executeSwap(
-          provider,
-          wallet,
-          tokenA,
-          tokenB,
-          swapAmount,
-          1,
-          feeTier
-        );
-
-        if (!success && retries < maxRetries) {
-          retries++;
-          console.log(`Waiting 10 seconds before retry...`);
-          await sleep(10000);
-        } else {
-          break;
+        if (result.error) {
+          const errorClassification = SwapErrorClassifier.classifyError(
+            result.error
+          );
+          console.log(`📋 Final error type: ${errorClassification.type}`);
         }
       }
 
-      if (success) {
-        completedSwaps++;
+      // Display running statistics
+      if (useSmartRetry && (i + 1) % 5 === 0) {
+        const stats = retryManager.getStatistics();
+        console.log(`\n📊 Current Statistics:`);
+        console.log(`   Total attempts: ${stats.totalAttempts}`);
+        console.log(`   Success rate: ${stats.successRate}`);
+        console.log(
+          `   Most common errors: ${JSON.stringify(
+            stats.errorsByType,
+            null,
+            2
+          )}`
+        );
       }
 
       // Wait random time between swaps if not the last swap
       if (i < totalSwaps - 1) {
         const waitTime = getRandomNumber(minWaitTime, maxWaitTime);
-        console.log(`Waiting ${waitTime} seconds before next swap...`);
+        console.log(`⏰ Waiting ${waitTime} seconds before next swap...`);
         await sleep(waitTime * 1000);
       }
     }
 
-    console.log(`\n====== Summary ======`);
-    console.log(`Total swaps completed: ${completedSwaps}/${totalSwaps}`);
+    // Final summary
+    console.log(`\n=================== FINAL SUMMARY ===================`);
+    console.log(`Total swaps attempted: ${totalSwaps}`);
+    console.log(`Successful swaps: ${completedSwaps}`);
+    console.log(`Failed swaps: ${failedSwaps}`);
+    console.log(
+      `Success rate: ${((completedSwaps / totalSwaps) * 100).toFixed(2)}%`
+    );
     console.log(`Wallets used: ${walletCount}`);
-    console.log(`Fee tier used: ${feeTier} (${feeTier / 10000}%)`);
+    console.log(`Primary fee tier: ${feeTier} (${feeTier / 10000}%)`);
+
+    // Get final stats (will be empty object if smart retry wasn't used)
+    const finalStats = useSmartRetry
+      ? retryManager.getStatistics()
+      : {
+          totalAttempts: totalSwaps,
+          successfulSwaps: completedSwaps,
+          errorsByType: {},
+          strategiesUsed: {},
+          successRate: ((completedSwaps / totalSwaps) * 100).toFixed(2) + "%",
+        };
+
+    if (useSmartRetry) {
+      console.log(`\n🤖 Smart Retry Statistics:`);
+      console.log(`   Total retry attempts: ${finalStats.totalAttempts}`);
+      console.log(`   Retry success rate: ${finalStats.successRate}`);
+      console.log(`   Error breakdown:`, finalStats.errorsByType);
+
+      if (Object.keys(finalStats.strategiesUsed).length > 0) {
+        console.log(
+          `   Most successful strategies:`,
+          finalStats.strategiesUsed
+        );
+      }
+
+      console.log(`\n💡 Recommendations for future runs:`);
+
+      // Analyze most common errors and provide recommendations
+      const errorTypes = Object.keys(finalStats.errorsByType);
+      if (errorTypes.length > 0) {
+        const mostCommonError = errorTypes.reduce((a, b) =>
+          finalStats.errorsByType[a] > finalStats.errorsByType[b] ? a : b
+        );
+
+        switch (mostCommonError) {
+          case "LIQUIDITY":
+            console.log(`   - Consider using smaller swap amounts`);
+            console.log(`   - Try different fee tiers (500 or 10000)`);
+            break;
+          case "NO_POOL":
+            console.log(`   - Verify token pair exists on this DEX`);
+            console.log(`   - Check different fee tiers for available pools`);
+            break;
+          case "PRICE_IMPACT":
+            console.log(`   - Use smaller swap amounts to reduce price impact`);
+            console.log(`   - Consider higher slippage tolerance`);
+            break;
+          case "GAS":
+            console.log(`   - Check network congestion`);
+            console.log(`   - Consider using different times for swapping`);
+            break;
+          case "NETWORK":
+            console.log(`   - Check RPC provider reliability`);
+            console.log(`   - Consider using a different provider`);
+            break;
+        }
+      }
+
+      // Analyze successful strategies
+      const strategies = Object.keys(finalStats.strategiesUsed);
+      if (strategies.length > 0) {
+        const bestStrategy = strategies.reduce((a, b) =>
+          finalStats.strategiesUsed[a] > finalStats.strategiesUsed[b] ? a : b
+        );
+
+        const [factor, fee, slippage] = bestStrategy.split("_");
+        console.log(
+          `   - Most successful configuration: ${(
+            parseFloat(factor) * 100
+          ).toFixed(0)}% amount, ${parseInt(fee) / 10000}% fee, ${
+            parseInt(slippage) / 100
+          }% slippage`
+        );
+      }
+    }
+
+    // Check final wallet balances
+    console.log(`\n💰 Final Wallet Balances:`);
+    for (let i = 0; i < Math.min(walletCount, 3); i++) {
+      // Show first 3 wallets
+      const wallet = generatedWallets[i].connect(provider);
+
+      try {
+        const tokenAContract = new ethers.Contract(
+          tokenAAddress,
+          ERC20_ABI,
+          wallet
+        );
+        const tokenBContract = new ethers.Contract(
+          tokenBAddress,
+          ERC20_ABI,
+          wallet
+        );
+
+        const balanceA = await tokenAContract.balanceOf(wallet.address);
+        const balanceB = await tokenBContract.balanceOf(wallet.address);
+        const ethBalance = await provider.getBalance(wallet.address);
+
+        console.log(`   Wallet ${i + 1} (${wallet.address.slice(0, 8)}...):`);
+        console.log(
+          `     ${tokenADetails.symbol}: ${ethers.utils.formatUnits(
+            balanceA,
+            tokenADetails.decimals
+          )}`
+        );
+        console.log(
+          `     ${tokenBDetails.symbol}: ${ethers.utils.formatUnits(
+            balanceB,
+            tokenBDetails.decimals
+          )}`
+        );
+        console.log(`     ETH: ${ethers.utils.formatEther(ethBalance)}`);
+      } catch (error) {
+        console.log(`     Error checking wallet ${i + 1}: ${error.message}`);
+      }
+    }
+
+    if (walletCount > 3) {
+      console.log(`   ... and ${walletCount - 3} more wallets`);
+    }
+
+    console.log(`\n🎉 Script execution completed!`);
+
+    // Offer to save detailed report
+    if (readline.keyInYN("Save detailed report to file?")) {
+      const reportData = {
+        timestamp: new Date().toISOString(),
+        configuration: {
+          totalSwaps,
+          walletCount,
+          minAmount: minAmountStr,
+          maxAmount: maxAmountStr,
+          feeTier,
+          minWaitTime,
+          maxWaitTime,
+          network: network.name,
+          chainId: network.chainId,
+          smartRetryEnabled: useSmartRetry,
+        },
+        results: {
+          completedSwaps,
+          failedSwaps,
+          successRate: ((completedSwaps / totalSwaps) * 100).toFixed(2) + "%",
+        },
+        smartRetryStats: finalStats,
+        tokens: {
+          tokenA: { symbol: tokenADetails.symbol, address: tokenAAddress },
+          tokenB: { symbol: tokenBDetails.symbol, address: tokenBAddress },
+        },
+      };
+
+      const fs = require("fs");
+      const filename = `swap_report_${Date.now()}.json`;
+
+      try {
+        fs.writeFileSync(filename, JSON.stringify(reportData, null, 2));
+        console.log(`📄 Report saved to: ${filename}`);
+      } catch (error) {
+        console.log(`❌ Could not save report: ${error.message}`);
+      }
+    }
   } catch (error) {
-    console.error(`Error in main function: ${error.message}`);
+    console.error(`💥 Fatal error in main function: ${error.message}`);
+    console.error(`Stack trace:`, error.stack);
+
+    // Emergency wallet balance check if we have wallets
+    if (
+      typeof generatedWallets !== "undefined" &&
+      generatedWallets.length > 0
+    ) {
+      console.log(`\n🚨 Emergency wallet balance check:`);
+
+      try {
+        const wallet = generatedWallets[0].connect(provider);
+        const ethBalance = await provider.getBalance(wallet.address);
+        console.log(
+          `   First wallet ETH balance: ${ethers.utils.formatEther(ethBalance)}`
+        );
+
+        if (typeof tokenADetails !== "undefined") {
+          const tokenAContract = new ethers.Contract(
+            tokenAAddress,
+            ERC20_ABI,
+            wallet
+          );
+          const balanceA = await tokenAContract.balanceOf(wallet.address);
+          console.log(
+            `   First wallet ${
+              tokenADetails.symbol
+            } balance: ${ethers.utils.formatUnits(
+              balanceA,
+              tokenADetails.decimals
+            )}`
+          );
+        }
+      } catch (balanceError) {
+        console.log(
+          `   Could not check emergency balances: ${balanceError.message}`
+        );
+      }
+    }
   }
 }
 
+// Enhanced error handling for the entire script
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("🚨 Unhandled Rejection at:", promise, "reason:", reason);
+  console.error("Stack trace:", reason.stack);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("🚨 Uncaught Exception:", error.message);
+  console.error("Stack trace:", error.stack);
+  process.exit(1);
+});
+
+// Graceful shutdown handler
+process.on("SIGINT", () => {
+  console.log("\n🛑 Received SIGINT. Gracefully shutting down...");
+  console.log("💡 If swaps were in progress, check wallet balances manually.");
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  console.log("\n🛑 Received SIGTERM. Gracefully shutting down...");
+  process.exit(0);
+});
+
 // Run the script
-main().catch(console.error);
+console.log("🚀 Starting Enhanced Uniswap V3 Swap Script...");
+main().catch((error) => {
+  console.error(`💥 Script failed:`, error.message);
+  console.error(`Stack trace:`, error.stack);
+  process.exit(1);
+});
